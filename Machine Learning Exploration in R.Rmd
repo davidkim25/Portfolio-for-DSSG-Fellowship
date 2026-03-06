@@ -1,0 +1,925 @@
+---
+title: "Banking Insurance Product – Tree-Based Models"
+output: html_document
+---
+
+## 1. Setup and Data
+
+```{r}
+## Libraries
+# library(tidyverse)
+# library(DescTools)
+# library(dplyr)
+# library(tidyr)
+# library(caret)
+# library(Metrics)
+# library(ROCit)
+# library(car)
+# library(randomForest)
+# library(pROC)
+# library(rpart)
+# library(rpart.plot)
+# library(xgboost)
+# library(Ckmeans.1d.dp)
+# library(pdp)
+
+theme_set(theme_minimal())
+
+# set seed
+set.seed(4321)
+
+
+# Load training/validation sets
+ins_t <- read.csv('insurance_t.csv')
+```
+
+```{r}
+# Checking missing values 
+colSums(is.na(ins_t))
+```
+
+## 2. Data Preparation and Imputation
+
+'Bank' standard: median (continuous), mode (categorical indicators).
+Keep preprocessing minimal — no variable selection before modeling.
+
+```{r}
+# Making copy for imputations
+train2 <- ins_t
+
+# Mode function
+get_mode <- function(x) {
+  ux <- unique(x[!is.na(x)])
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+# CONTINUOUS variables - use MEDIAN
+continuous_impute <- c("ACCTAGE", "PHONE", "POSAMT", 
+                       "INVBAL", "CCBAL", "CCPURC", 
+                       "INCOME", "LORES", "HMVAL", "AGE", "CRSCORE", "POS")
+
+for (var in continuous_impute) {
+  if (any(is.na(train2[[var]]))) {
+    train2[[var]][is.na(train2[[var]])] <- median(train2[[var]], na.rm = TRUE)
+  }
+}
+
+# CATEGORICAL (indicators) - use MODE  
+categorical_impute <- c("INV", "CC")
+
+for (var in categorical_impute) {
+  if (any(is.na(train2[[var]]))) {
+    train2[[var]][is.na(train2[[var]])] <- get_mode(train2[[var]])
+  }
+}
+
+# Store values for validation set - future hw
+# median_vals <- sapply(train2[continuous_impute], median, na.rm = TRUE)
+# mode_vals <- sapply(train2[categorical_impute], get_mode)
+
+# removing HMOWN NA's
+train2 <- na.omit(train2)
+
+# Verify no more nulls
+colSums(is.na(train2))
+
+imputed_train <- train2
+
+
+
+```
+
+## 3. Random Forest Model
+
+### 3.1 Convert Target to Factor (Required for Classification)
+
+```{r}
+# Convert INS to factor for classification
+train2$INS <- as.factor(train2$INS)
+
+# Convert to data frame (required for randomForest)
+train <- as.data.frame(train2)
+
+# Check the target variable
+table(train$INS)
+
+# Prop Table
+prop.table(table(train$INS))
+```
+
+### 3.2 Initial Random Forest Model
+
+Initial unbalanced and unedited model
+
+```{r}
+set.seed(12345)
+rf.insurance.unbalanced <- randomForest(INS ~ ., 
+                                        data = train, 
+                                        ntree = 500, 
+                                        nodesize = 1,
+                                        importance = TRUE)
+# View model summary
+print(rf.insurance.unbalanced)
+
+# Plot error vs number of trees
+plot(rf.insurance.unbalanced, main = "Random Forest: Error vs Number of Trees")
+legend("topright", 
+       legend = c("OOB Error", "Class 0", "Class 1"),
+       col = 1:3, 
+       lty = 1:3,
+       cex = 0.8)
+```
+
+First set of edits
+
+```{r}
+# Check class distribution
+cat("Class distribution:\n")
+print(table(train$INS))
+print(prop.table(table(train$INS)))
+
+# Build next random forest with class balancing
+# Using sampsize to balance the classes in each bootstrap sample
+minority_class_size <- min(table(train$INS))
+```
+
+```{r}
+# Build next random forest with default parameters; edited sample size and ntree
+set.seed(12345)
+rf.full <- randomForest(INS ~ ., 
+                             data = train, 
+                             ntree = 250, 
+                             importance = TRUE,
+                              nodesize = 1,
+                             sampsize = c(minority_class_size, minority_class_size))
+
+# View model summary
+print(rf.full)
+
+# Plot error vs number of trees
+plot(rf.full, main = "Random Forest: Error vs Number of Trees (Balanced)")
+legend("topright", 
+       legend = c("OOB Error", "Class 0", "Class 1"),
+       col = 1:3, 
+       lty = 1:3,
+       cex = 0.8)
+```
+
+```{r}
+# Compare with unbalanced model
+cat("\n=== Comparison: Unbalanced vs Balanced ===\n")
+cat("Unbalanced model:\n")
+print(rf.insurance.unbalanced$confusion)
+cat("\nBalanced model:\n")
+print(rf.full$confusion)
+```
+
+### 3.3 Variable Selection Attempt Using Random Variable
+
+```{r}
+# Add random variable for variable selection sanity check
+train$random <- rnorm(nrow(train))
+
+# Rebuild with random variable
+set.seed(12345)
+rf.insurance.random <- randomForest(INS ~ ., 
+                                    data = train, 
+                                    ntree = 500, 
+                                    importance = TRUE)
+
+# Plot variable importance
+varImpPlot(rf.insurance.random, 
+           sort = TRUE, 
+           n.var = min(20, ncol(train)-1),
+           main = "Variable Importance - Check for Variables Below Random")
+
+# Get importance values
+importance_df <- as.data.frame(importance(rf.insurance.random))
+importance_df$Variable <- rownames(importance_df)
+importance_df <- importance_df[order(-importance_df$MeanDecreaseGini),]
+
+# Show all variables with importance
+print(importance_df)
+
+# Identify variables below random variable
+random_importance <- importance_df[importance_df$Variable == "random", "MeanDecreaseGini"]
+cat("\nRandom variable importance (MeanDecreaseGini):", random_importance, "\n")
+
+# Variables to potentially remove (below or near random)
+weak_vars <- importance_df[importance_df$MeanDecreaseGini <= random_importance * 1.2, "Variable"]
+cat("\nVariables below or near random variable:\n")
+print(weak_vars)
+```
+
+Remove random variable after
+
+```{r}
+train$random <- NULL
+importance_df <- subset(importance_df, Variable != "random")
+```
+
+### 3.3.5 Variable Selection Using Cross-Validation Performance Approach
+
+```{r}
+# Extract and rank variables by importance
+importance_full <- as.data.frame(importance(rf.full))
+importance_full$Variable <- rownames(importance_full)
+importance_full <- importance_full[order(-importance_full$MeanDecreaseGini),]
+
+cat("\n=== Variable Importance Rankings ===\n")
+print(importance_full[, c("Variable", "MeanDecreaseGini")])
+```
+
+```{r}
+# Plot full importance
+varImpPlot(rf.full, 
+           sort = TRUE,
+           main = "Variable Importance - Full Model")
+```
+
+### 3.4 OOB Testing
+
+#### Testing different numbers of variables using OOB Error
+
+Finding minimum OOB for current random forest parameters Test models with top 5, 10, 15, 20, 25, 30, 35, all variables
+
+```{r}
+n_vars_to_test <- c(5, 10, 15, 20, 25, 30, 35, 37)
+
+# empty data frame for results
+oob_results <- data.frame( 
+  n_variables = integer(),
+  oob_error = numeric(),
+  class_0_error = numeric(),
+  class_1_error = numeric()
+  )
+
+
+set.seed(12345)
+for (n_vars in n_vars_to_test) {
+  selected_vars <- head(importance_full$Variable, n_vars)
+  train_subset <- train[, c(selected_vars, "INS")]
+  train_subset$INS <- as.factor(train_subset$INS)
+  
+  rf_model <- randomForest(
+    INS ~ .,
+    data = train_subset,
+    ntree = 250,
+    importance = TRUE,
+    nodesize = 1,
+    sampsize = c(minority_class_size, minority_class_size)
+  )
+  
+  # Extract OOB + class-specific errors
+  last_row <- rf_model$err.rate[nrow(rf_model$err.rate), ]
+  oob_error <- last_row["OOB"]
+  class_0_error <- last_row["0"]
+  class_1_error <- last_row["1"]
+  
+  oob_results <- rbind(oob_results, data.frame(
+    n_variables = n_vars,
+    oob_error = oob_error,
+    class_0_error = class_0_error,
+    class_1_error = class_1_error
+  ))
+}
+
+# Check results table
+print(oob_results)
+```
+
+#### Plot OOB Error vs Number of Variables
+
+```{r}
+# Plot with ggplot2
+ggplot(oob_results, aes(x = n_variables, y = oob_error)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "darkred", size = 3) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "OOB Error vs. Number of Variables",
+    x = "Number of Variables",
+    y = "OOB Error Rate"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+#### Plot class-specific errors too
+
+```{r}
+library(reshape2)
+
+# Reshape data for plotting multiple lines
+oob_long <- melt(
+  oob_results,
+  id.vars = "n_variables",
+  variable.name = "Error_Type",
+  value.name = "Error_Rate"
+)
+
+ggplot(oob_long, aes(x = n_variables, y = Error_Rate, color = Error_Type)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "OOB Error by Number of Variables",
+    x = "Number of Variables",
+    y = "Error Rate",
+    color = "Error Type"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+### 3.5 Select variables based on CV results and interpretation
+
+```{r}
+# Rule of thumb: Accept models within 1-2% of minimum error for parsimony
+tolerance <- 0.02  # 2% tolerance
+acceptable_models <- oob_results[oob_results$oob_error <= min(oob_results$oob_error) * (1 + tolerance), ]
+
+cat("\nModels within", tolerance*100, "% of minimum error:\n")
+print(acceptable_models[, c("n_variables", "oob_error")])
+```
+
+Models with 25, 30, and 37 fit the OOB error threshold
+
+#### Test 25 variables for parsimony
+
+```{r}
+# Choose simplest acceptable model
+simplest_n_vars <- min(acceptable_models$n_variables)
+cat("\n=== SIMPLEST SELECTION ===\n")
+cat("Selected number of variables: 25 \n")
+cat("OOB Error:", round(acceptable_models$oob_error[acceptable_models$n_variables == 25], 4), "\n")
+cat("vs. Absolute minimum:", round(min(oob_results$oob_error), 4), "\n")
+
+# Create reduced selected dataset
+simplest_selected_vars <- head(importance_full$Variable, simplest_n_vars)
+cat("\nVariables in reduced model:\n")
+print(simplest_selected_vars)
+
+train.selected <- train[, c(simplest_selected_vars, "INS")]
+train.selected$INS <- as.factor(train.selected$INS)
+```
+
+### 3.6 Visualizing and testing selected variables
+
+#### 25 Variables - visualizing the selected vs non-selected variables
+
+```{r}
+importance_full$Selected <- ifelse(importance_full$Variable %in% simplest_selected_vars, 
+                                  "Kept", "Removed")
+
+ggplot(importance_full, aes(x = reorder(Variable, MeanDecreaseGini), 
+                           y = MeanDecreaseGini,
+                           fill = Selected)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("Kept" = "steelblue", "Removed" = "gray70")) +
+  coord_flip() +
+  labs(title = paste("Variable Selection: 25 Variables Kept"),
+       subtitle = "Based on cross-validation performance",
+       x = "Variable",
+       y = "Mean Decrease Gini (Importance)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+cat("\n=== Variable Selection Summary ===\n")
+cat("Original variables:", ncol(train) - 1, "\n")
+cat("Variables selected: 25 \n")
+cat("Variables removed:", (ncol(train) - 1) - 25, "\n")
+cat("\nSelection criterion: Minimize OOB error with parsimony\n")
+```
+
+#### Test 30 vars for parsimony
+
+```{r}
+# Choose middle simple acceptable model
+simple_n_vars <- 30
+cat("\n=== SIMPLEST SELECTION ===\n")
+cat("Selected number of variables: 30 \n")
+
+# Create reduced selected dataset
+simple_selected_vars <- head(importance_full$Variable, simple_n_vars)
+cat("\nVariables in reduced model:\n")
+print(simple_selected_vars)
+
+train.selected <- train[, c(simple_selected_vars, "INS")]
+train.selected$INS <- as.factor(train.selected$INS)
+```
+
+Visualize the selected vs non-selected variables
+
+```{r}
+importance_full$simple_selected_vars <- ifelse(importance_full$Variable %in% simple_selected_vars, "Kept", "Removed")
+
+ggplot(importance_full, aes(x = reorder(Variable, MeanDecreaseGini), 
+                           y = MeanDecreaseGini,
+                           fill = simple_selected_vars)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("Kept" = "steelblue", "Removed" = "gray70")) +
+  coord_flip() +
+  labs(title = paste("Variable Selection: 30 Variables Kept"),
+       subtitle = "Based on cross-validation performance",
+       x = "Variable",
+       y = "Mean Decrease Gini (Importance)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+cat("\n=== Variable Selection Summary ===\n")
+cat("Original variables:", ncol(train) - 1, "\n")
+cat("Variables selected: 30 \n")
+cat("Variables removed:", (ncol(train) - 1) - 30, "\n")
+cat("\nSelection criterion: Minimize OOB error with parsimony\n")
+```
+
+### 3.7 Tested tuned mtry Parameter (gives default which is 5)
+
+```{r}
+# Tune mtry (number of variables considered at each split)
+# Default for classification is sqrt(p)
+set.seed(12345)
+
+cat("\n=== Tuning mtry Parameter ===\n")
+cat("Default mtry for classification: sqrt(p) =", floor(sqrt(ncol(train.selected) - 1)), "\n\n")
+
+tuneRF_result <- tuneRF(x = train.selected[, -which(names(train.selected) == "INS")], 
+                        y = train.selected$INS,
+                        plot = TRUE, 
+                        ntreeTry = 250, 
+                        stepFactor = 0.5,
+                        improve = 0.01,
+                        trace = TRUE,
+                        doBest = FALSE,
+                        nodesize = 1,
+                        sampsize = c(minority_class_size, minority_class_size))
+
+print(tuneRF_result)
+
+# Get optimal mtry
+optimal_mtry <- tuneRF_result[which.min(tuneRF_result[,2]), 1]
+cat("\nOptimal mtry:", optimal_mtry, "\n")
+cat("Default mtry (sqrt(p)):", floor(sqrt(ncol(train.selected) - 1)), "\n")
+```
+
+### 3.8 Reduced Variable Random Forest Model
+
+#### 25 variables
+
+```{r}
+# Build reduced varaible model with selected variables, nodesize, and balanced sampling
+set.seed(12345)
+rf.insurance.reduced <- randomForest(INS ~ ., 
+                                   data = train.selected, 
+                                   ntree = 250,
+                                   nodesize = 1,
+                                   importance = TRUE,
+                                   sampsize = c(minority_class_size, minority_class_size))
+
+cat("\n=== Reduced Var Random Forest Model ===\n")
+print(rf.insurance.reduced)
+
+# Plot final model error
+plot(rf.insurance.reduced, main = "Reduced Var Random Forest: Error vs Trees")
+legend("topright", 
+       legend = c("OOB Error", "Class 0", "Class 1"),
+       col = 1:3, 
+       lty = 1:3,
+       cex = 0.8)
+```
+
+#### 30 Variables
+
+```{r}
+selected_vars <- head(importance_full$Variable, 30)
+train_subset <- train[, c(selected_vars, "INS")]
+train_subset$INS <- as.factor(train_subset$INS)
+  
+rf.mild.reduced <- randomForest(
+    INS ~ .,
+    data = train_subset,
+    ntree = 250,
+    importance = TRUE,
+    nodesize = 1,
+    sampsize = c(minority_class_size, minority_class_size)
+  )
+
+print(rf.mild.reduced)
+```
+
+### 3.9 Comparing to full balanced model from earlier
+
+```{r}
+set.seed(12345)
+rf.full.final <- randomForest(INS ~ ., 
+                             data = train, 
+                             ntree = 250, 
+                             importance = TRUE,
+                             nodesize = 1,
+                             sampsize = c(minority_class_size, minority_class_size))
+
+print(rf.full.final)
+```
+
+```{r}
+# Compare all models
+cat("\n=== Model Performance Comparison ===\n")
+cat("Unbalanced Model (37 vars):\n")
+cat("  OOB Error:", round(mean(rf.insurance.unbalanced$err.rate[,1]), 4), "\n")
+cat("  Class 0 Error:", round(rf.insurance.unbalanced$confusion[1, "class.error"], 4), "\n")
+cat("  Class 1 Error:", round(rf.insurance.unbalanced$confusion[2, "class.error"], 4), "\n\n")
+
+cat("Reduced Var Tuned Model (25 vars):\n")
+cat("  OOB Error:", round(mean(rf.insurance.reduced$err.rate[,1]), 4), "\n")
+cat("  Class 0 Error:", round(rf.insurance.reduced$confusion[1, "class.error"], 4), "\n")
+cat("  Class 1 Error:", round(rf.insurance.reduced$confusion[2, "class.error"], 4), "\n\n")
+
+cat("Mildly Reduced Var Tuned Model (30 vars):\n")
+cat("  OOB Error:", round(mean(rf.mild.reduced$err.rate[,1]), 4), "\n")
+cat("  Class 0 Error:", round(rf.mild.reduced$confusion[1, "class.error"], 4), "\n")
+cat("  Class 1 Error:", round(rf.mild.reduced$confusion[2, "class.error"], 4), "\n\n")
+
+cat("Final Full Balanced Model (37 vars):\n")
+cat("  OOB Error:", round(mean(rf.full.final$err.rate[,1]), 4), "\n")
+cat("  Class 0 Error:", round(rf.full.final$confusion[1, "class.error"], 4), "\n")
+cat("  Class 1 Error:", round(rf.full.final$confusion[2, "class.error"], 4), "\n\n")
+
+```
+
+### 3.95 Testing Accuracy and AUC between 30 and 37 models
+
+#### 30 var (rf.mild.reduced)
+
+```{r}
+# Get OOB predictions (built-in cross-validation from Random Forest)
+# Each observation is predicted by trees that didn't use it in training
+oob_pred_class <- predict(rf.mild.reduced, type = "response")
+oob_pred_prob <- predict(rf.mild.reduced, type = "prob")[,2]
+
+# Confusion matrix
+conf_matrix <- table(Predicted = oob_pred_class, Actual = train.selected$INS)
+cat("\n=== Confusion Matrix (Out-of-Bag) ===\n")
+print(conf_matrix)
+
+# Calculate accuracy
+accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+cat("\nAccuracy (OOB):", round(accuracy, 4), "\n")
+
+# use ROCit package for consistency with logistic regression
+roc_empirical <- rocit(score = oob_pred_prob, 
+                       class = train.selected$INS)
+
+plot(roc_empirical, 
+     col = c("blue", "red"), 
+     legend = FALSE,
+     YIndex = FALSE,
+     main = "ROC Curve - Random Forest (ROCit)")
+grid()
+
+# Get AUC from ROCit
+auc_rocit <- roc_empirical$AUC
+cat("AUC (ROCit):", round(auc_rocit, 4), "\n")
+
+# Add AUC text to plot
+text(0.6, 0.2, paste("AUC =", round(auc_rocit, 4)), cex = 1.3, font = 2)
+
+```
+
+#### 37 var (rf.full.final)
+
+```{r}
+# Get OOB predictions (built-in cross-validation from Random Forest)
+# Each observation is predicted by trees that didn't use it in training
+oob_pred_class <- predict(rf.full.final, type = "response")
+oob_pred_prob <- predict(rf.full.final, type = "prob")[,2]
+
+# Confusion matrix
+conf_matrix <- table(Predicted = oob_pred_class, Actual = train.selected$INS)
+cat("\n=== Confusion Matrix (Out-of-Bag) ===\n")
+print(conf_matrix)
+
+# Calculate accuracy
+accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+cat("\nAccuracy (OOB):", round(accuracy, 4), "\n")
+
+# use ROCit package for consistency with logistic regression
+roc_empirical <- rocit(score = oob_pred_prob, 
+                       class = train.selected$INS)
+
+plot(roc_empirical, 
+     col = c("blue", "red"), 
+     legend = FALSE,
+     YIndex = FALSE,
+     main = "ROC Curve - Random Forest (ROCit)")
+grid()
+
+# Get AUC from ROCit
+auc_rocit <- roc_empirical$AUC
+cat("AUC (ROCit):", round(auc_rocit, 4), "\n")
+
+# Add AUC text to plot
+text(0.6, 0.2, paste("AUC =", round(auc_rocit, 4)), cex = 1.3, font = 2)
+
+```
+
+FINAL MODEL CHOSEN FOR PARSIMONY - BALANCED MODEL WITH 30 VAR
+
+### Variable Importance for Final Model
+
+```{r}
+# Plot variable importance for final model
+varImpPlot(rf.mild.reduced, 
+           sort = TRUE,
+           main = paste("Final Model: Variable Importance (30 vars):\n"))
+
+# Get importance values - using MeanDecreaseGini as the ranking metric
+importance_final <- as.data.frame(importance(rf.mild.reduced))
+importance_final$Variable <- rownames(importance_final)
+importance_final <- importance_final[order(-importance_final$MeanDecreaseGini),]
+
+# Display variable importance ranked by MeanDecreaseGini
+cat("\n=== Variable Importance (Ranked by MeanDecreaseGini) ===\n")
+print(importance_final[, c("Variable", "MeanDecreaseGini")])
+
+# Create a clean visualization
+ggplot(importance_final, aes(x = reorder(Variable, MeanDecreaseGini), 
+                             y = MeanDecreaseGini)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Variable Importance - Final Random Forest Model",
+       x = "Variable",
+       y = "Mean Decrease Gini") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 9))
+```
+
+## 4. Model Evaluation Using Out-of-Bag Predictions
+
+### 4.1 OOB Predictions and Performance
+
+```{r}
+# Get OOB predictions (built-in cross-validation from Random Forest)
+# Each observation is predicted by trees that didn't use it in training
+oob_pred_class <- predict(rf.mild.reduced, type = "response")
+oob_pred_prob <- predict(rf.mild.reduced, type = "prob")[,2]
+
+# Confusion matrix
+conf_matrix <- table(Predicted = oob_pred_class, Actual = train.selected$INS)
+cat("\n=== Confusion Matrix (Out-of-Bag) ===\n")
+print(conf_matrix)
+
+# Calculate accuracy
+accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+cat("\nAccuracy (OOB):", round(accuracy, 4), "\n")
+```
+
+### 4.2 ROC Curve and AUC
+
+```{r}
+# Create ROC object using ROCit for consistency
+roc_rf_rocit <- rocit(score = oob_pred_prob, 
+                      class = train.selected$INS)
+
+# Print AUC
+print("Area Under ROC Curve (AUC):")
+print(round(roc_rf_rocit$AUC, 4))
+
+# Plot ROC curve
+plot(roc_rf_rocit, col = "blue", lwd = 2)
+title(main = "ROC Curve for Random Forest (Training Data)")
+grid()
+
+# Add AUC text to plot
+text(0.6, 0.3, paste("AUC =", round(auc_rocit, 4)), cex = 1.3, font = 2)
+```
+
+### 4.3 Additional Performance Metrics
+
+```{r}
+# Calculate additional metrics
+TP <- conf_matrix[2,2]
+TN <- conf_matrix[1,1]
+FP <- conf_matrix[2,1]
+FN <- conf_matrix[1,2]
+
+sensitivity <- TP / (TP + FN)
+specificity <- TN / (TN + FP)
+precision <- TP / (TP + FP)
+f1_score <- 2 * (precision * sensitivity) / (precision + sensitivity)
+
+cat("\n=== Performance Metrics (Out-of-Bag) ===\n")
+cat("Sensitivity (Recall):", round(sensitivity, 4), "\n")
+cat("Specificity:", round(specificity, 4), "\n")
+cat("Precision:", round(precision, 4), "\n")
+cat("F1 Score:", round(f1_score, 4), "\n")
+
+# Create comprehensive summary table
+performance_summary <- data.frame(
+  Metric = c("Accuracy", "Sensitivity", "Specificity", "Precision", "F1 Score", "AUC"),
+  Value = round(c(accuracy, sensitivity, specificity, precision, f1_score, auc_rocit), 4)
+)
+cat("\n=== Performance Summary Table ===\n")
+print(performance_summary, row.names = FALSE)
+```
+
+#### Checking R\^2
+
+```{r}
+# Using predicted probabilities (continuous values 0-1)
+# Treat actual classes as numeric (0 and 1) for these calculations
+actual_numeric <- as.numeric(train.selected$INS) - 1  # Convert factor to 0/1
+pred_prob <- oob_pred_prob  # Already have this from earlier
+
+# R² (treating as regression problem)
+# R² = 1 - (SS_residual / SS_total)
+ss_residual <- sum((actual_numeric - pred_prob)^2)
+ss_total <- sum((actual_numeric - mean(actual_numeric))^2)
+r_squared <- 1 - (ss_residual / ss_total)
+
+cat("R² (Pseudo R-squared):", round(r_squared, 4), "\n")
+cat("  Interpretation: Model explains", round(r_squared * 100, 1), 
+    "% of variance in purchase behavior\n")
+```
+
+## 5. XGBoost Model
+
+### 5.1 Initial Model and Interpretation
+
+```{r}
+#Create random variable
+imputed_train$random <- rnorm(nrow(imputed_train))
+
+#Split X and y
+#model.matrix uses OHE
+train_x <- model.matrix(INS ~ ., data = imputed_train)[, -1]
+train_y <- imputed_train$INS
+```
+
+```{r}
+set.seed(4321)
+
+#Build XGB- set objective = binary:logistic for classification problem
+#subsample = 0.5 prevents overfitting
+#nrounds = 100 is the number of boosting iterations (ie trees)
+xgb.ins_t <- xgboost(data = train_x, 
+                     label = train_y, 
+                     subsample = 0.5, 
+                     nrounds = 100, 
+                     objective = "binary:logistic", 
+                     verbose = 0)
+```
+
+```{r}
+set.seed(4321)
+
+#Use cross validation
+xgbcv.ins_t<- xgb.cv(
+  data = train_x, 
+  label = train_y, 
+  subsample = 0.5, 
+  nrounds = 100,
+  nfold = 10, 
+  objective = "binary:logistic", 
+  verbose = 0
+)
+
+#Evaluation metrics for each boosting round and fold
+print(xgbcv.ins_t)
+```
+
+```{r}
+set.seed(4321)
+
+tune_grid <- expand.grid(
+  nrounds = 24,
+  eta = c(0.1, 0.15, 0.2, 0.25, 0.3),
+  max_depth = c(1:4),
+  gamma = c(0,1,3),
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = c(0.25, 0.5, 0.75, 1)
+)
+
+```
+
+```{r}
+set.seed(4321)
+
+#Change y to a factor for caret model
+train_y <- factor(imputed_train$INS, levels = c(0,1), labels = c("No","Yes"))
+
+xgb.caret <- train(
+  x = train_x, 
+  y = train_y,
+  method = "xgbTree",
+  tuneGrid = tune_grid,
+  trControl = trainControl(method = 'cv', number = 10, classProbs = TRUE, summaryFunction = twoClassSummary),
+  metric = 'ROC'
+)
+```
+
+```{r}
+plot(xgb.caret)
+xgb.caret$bestTune
+```
+
+### 5.2 Tuning Model and Variable Importance
+
+```{r}
+train_y <- as.numeric(imputed_train$INS)   # ensure 0/1 numeric
+
+# Fit tuned model with best shrinkage (eta), depth (3)
+xgb.final <- xgboost(
+  data = train_x, 
+  label = train_y, 
+  subsample = 1,
+  min_child_weight = 5,
+  nrounds = 24, 
+  gamma = 3,
+  eta = 0.25, 
+  max_depth = 4,
+  objective = "binary:logistic",
+  verbose = 0
+)
+```
+
+```{r}
+# Variable importance including random variable
+xgb.ggplot.importance(xgb.importance(feature_names = colnames(train_x), model = xgb.final))
+
+imp_table <- xgb.importance(
+  feature_names = colnames(train_x),
+  model = xgb.final
+)
+
+# View as a table
+print(imp_table)
+```
+
+```{r}
+#Check AUC on train
+pred_train <- predict(xgb.final, train_x)
+
+roc_train <- pROC::roc(response = train_y,
+                       predictor = pred_train,
+                       quiet = TRUE)
+
+pROC::auc(roc_train)
+```
+
+### 5.3 ROC Curve and Additional Performance Metrics
+
+```{r}
+roc <- rocit(pred_train, train_y)
+
+# Plot ROC with blue line + title
+plot(roc,
+     col = "blue",
+     lwd = 2,
+     YI = TRUE,
+     diag = TRUE)
+
+title("ROC Curve for XGBoost Model (Training Data)", cex.main = 1)
+
+auc_val <- round(roc$AUC, 3)
+text(
+  0.65, 0.4,
+  labels = paste0("AUC = ", auc_val),
+  cex = 1,
+  col = "black",
+  font = 2       
+)
+
+summary(roc)
+```
+
+```{r}
+#Confusion Matrix with optimal cutoff
+cutoff <- 0.3441080
+pred_class <- ifelse(pred_train > cutoff, 1, 0)
+table(Predicted = pred_class, Actual = train_y)
+```
+
+```{r}
+#View Correlation Matrix
+pred_factor <- factor(pred_class, levels = c(0,1))
+actual_factor <- factor(train_y, levels = c(0,1))
+
+cm <- confusionMatrix(pred_factor, actual_factor, positive = "1")
+cm
+```
+
+```{r}
+accuracy     <- cm$overall["Accuracy"]
+sensitivity  <- cm$byClass["Sensitivity"]
+specificity  <- cm$byClass["Specificity"]
+precision    <- cm$byClass["Pos Pred Value"]  
+f1           <- cm$byClass["F1"]
+
+round(c(accuracy, sensitivity, specificity, precision, f1), 4)
+```
